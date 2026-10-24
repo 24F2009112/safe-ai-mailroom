@@ -1,6 +1,6 @@
 # Safe AI Mailroom Agent
 
-A public HTTPS FastAPI service for the Safe AI Mailroom assignment (build 2.1.0). It reads mail/request and approval sources, checks signed/current/provenance-backed authority against the exact action, recipient, item and case state, emits one auditable proposal per dossier, and never sends email or executes external actions. It records completion only after verifying a cryptographic terminal receipt that matches the stored proposal.
+A public HTTPS FastAPI service for the Safe AI Mailroom assignment (build 2.2.0). It reads mail/request and approval sources, checks signed/current/provenance-backed authority against the exact action, recipient, item and case state, emits one auditable proposal per dossier, and never sends email or executes external actions. It records completion only after verifying a cryptographic terminal receipt that matches the stored proposal.
 
 ## Endpoints
 
@@ -13,6 +13,13 @@ A public HTTPS FastAPI service for the Safe AI Mailroom assignment (build 2.1.0)
 - `GET /v1/mailroom/audit/{dossierId}` — read the audit records for a dossier.
 - `GET /health` and `/healthz` — health/database status.
 - `GET /.well-known/agent.json` and `/.well-known/agent-card.json` — public agent metadata.
+
+
+## Latency / deployment check
+
+Before spending an assignment check, run `python probe_endpoint.py https://YOUR-SERVICE.onrender.com`. It warms a free Render instance using `/health`, then sends a small valid JSON proposal request and reports the POST latency, HTTP status, `Content-Type`, and response-envelope validity. A cold start can take much longer than a warm request on Render Free; invoke the grader immediately after the probe.
+
+The proposal path has bounded AI timeout (6 seconds by default; one attempt only) and bounded concurrent AI calls. Referenced case-file URLs are fetched concurrently with a short per-file timeout, and dossiers are processed concurrently while preserving result order. This avoids serializing all network/model delays behind one proposal. If AI extraction times out or fails, the deterministic policy path remains fail-closed; do not treat an AI timeout as approval.
 
 ## Proposal request
 

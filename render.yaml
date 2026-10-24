@@ -18,7 +18,11 @@ services:
       - key: DATABASE_PATH
         value: ./mailroom_audit.sqlite3
       - key: AI_TIMEOUT_SECONDS
-        value: "20"
+        value: "6"
+      - key: AI_CONCURRENCY
+        value: "16"
+      - key: CASE_FILE_TIMEOUT_SECONDS
+        value: "5"
       - key: RECEIPT_HMAC_SECRET
         sync: false
       - key: RECEIPT_PUBLIC_KEY

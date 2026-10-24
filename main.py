@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 APP_NAME = "Safe AI Mailroom Agent"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
@@ -46,7 +46,9 @@ RECEIPT_PUBLIC_KEY = (
 ).replace("\\n", "\n").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./mailroom_audit.sqlite3")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-AI_TIMEOUT_SECONDS = max(2, min(int(os.getenv("AI_TIMEOUT_SECONDS", "18")), 45))
+AI_TIMEOUT_SECONDS = max(2, min(int(os.getenv("AI_TIMEOUT_SECONDS", "6")), 8))
+AI_CONCURRENCY = max(1, min(int(os.getenv("AI_CONCURRENCY", "16")), 32))
+CASE_FILE_TIMEOUT_SECONDS = max(2, min(float(os.getenv("CASE_FILE_TIMEOUT_SECONDS", "5")), 8))
 MAX_DOSSIERS = max(1, min(int(os.getenv("MAX_DOSSIERS", "100")), 200))
 MAX_REQUEST_BYTES = max(32_768, min(int(os.getenv("MAX_REQUEST_BYTES", "5000000")), 10_000_000))
 
@@ -59,6 +61,17 @@ app = FastAPI(
         "verified, matching terminal receipt for completion."
     ),
 )
+
+
+@app.middleware("http")
+async def response_timing_headers(request: Request, call_next):
+    """Expose server-side processing time for diagnosing proposal deadlines."""
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    response.headers["X-Processing-Time-Ms"] = f"{elapsed_ms:.2f}"
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.2f}"
+    return response
 
 CURRENT_STATUS = {"current", "active", "valid", "approved", "effective", "in_force", "in force", "not_expired"}
 INVALID_STATUS = {"expired", "revoked", "superseded", "withdrawn", "cancelled", "canceled", "inactive", "invalid", "old", "obsolete", "stale", "outdated", "lapsed", "replaced", "denied", "rejected", "unapproved", "not_approved"}
@@ -495,17 +508,14 @@ async def ask_model_for_facts(dossier: dict[str, Any], source_text: str) -> dict
         "response_format": {"type": "json_object"}, "max_tokens": 1200,
     }
     last_error: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(1):
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(AI_TIMEOUT_SECONDS, connect=7)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(AI_TIMEOUT_SECONDS, connect=min(3, AI_TIMEOUT_SECONDS))) as client:
                 response = await client.post(
                     OPENAI_BASE_URL + "/chat/completions",
                     headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                     json=body,
                 )
-            if response.status_code in {429, 500, 502, 503, 504} and attempt == 0:
-                await asyncio.sleep(0.3)
-                continue
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
             if isinstance(content, list):
@@ -962,7 +972,10 @@ async def fetch_case_file(url: str) -> tuple[str, str]:
     if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal")):
         raise HTTPException(status_code=422, detail="Private/local case-file hosts are not allowed")
     try:
-        addresses = await asyncio.get_running_loop().getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
+        addresses = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM),
+            timeout=min(2.0, CASE_FILE_TIMEOUT_SECONDS),
+        )
         for item in addresses:
             ip = ipaddress.ip_address(item[4][0])
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
@@ -972,7 +985,7 @@ async def fetch_case_file(url: str) -> tuple[str, str]:
     except Exception:
         raise HTTPException(status_code=422, detail="caseFileUrl host could not be resolved safely")
     try:
-        async with httpx.AsyncClient(timeout=9, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(CASE_FILE_TIMEOUT_SECONDS, connect=min(2.0, CASE_FILE_TIMEOUT_SECONDS)), follow_redirects=False) as client:
             response = await client.get(url, headers={"Accept": "application/json, text/plain, text/*"})
         response.raise_for_status()
         return url, response.text[:MAX_REQUEST_BYTES]
@@ -1431,13 +1444,28 @@ async def fetch_and_prepare_dossier(raw: dict[str, Any]) -> tuple[dict[str, Any]
     embedded_urls = collect_case_file_url_refs(dossier)
     fetched: list[tuple[str, str]] = []
     already_have = {content for _, content in texts}
-    for name, url in embedded_urls:
-        fetched_url, content = await fetch_case_file(url)
-        if content not in already_have:
-            url_name = urlparse(fetched_url).path.rsplit("/", 1)[-1] or "case-file"
-            label = name if name and name not in {"case", "case.caseFiles", "case.files", "case.documents"} and not name.startswith("case.") else url_name
-            fetched.append((label, content))
-            already_have.add(content)
+    # Case files are independent reads. Fetch them concurrently so ten ordinary HTTPS
+    # documents do not add ten sequential network timeouts to the proposal request.
+    if embedded_urls:
+        results = await asyncio.gather(
+            *(fetch_case_file(url) for _, url in embedded_urls),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            # Fail closed, but after concurrently trying every source. Do not silently
+            # authorize an action if a referenced authority document could not be read.
+            first = failures[0]
+            if isinstance(first, HTTPException):
+                raise first
+            raise HTTPException(status_code=422, detail="one or more case-file URLs could not be read safely")
+        for (name, _url), result in zip(embedded_urls, results):
+            fetched_url, content = result
+            if content not in already_have:
+                url_name = urlparse(fetched_url).path.rsplit("/", 1)[-1] or "case-file"
+                label = name if name and name not in {"case", "case.caseFiles", "case.files", "case.documents"} and not name.startswith("case.") else url_name
+                fetched.append((label, content))
+                already_have.add(content)
     if fetched:
         texts.extend(fetched)
         dossier = hydrate_case_text(dossier, fetched)
@@ -1456,9 +1484,12 @@ async def build_response(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
     nested_has_dossiers = isinstance(nested, dict) and any(norm_key(k) in list_keys and isinstance(v, list) for k, v in nested.items())
     nested_shared = {k: v for k, v in nested.items() if norm_key(k) not in list_keys} if nested_has_dossiers else {}
     shared = {**outer_shared, **nested_shared}
-    proposals: list[dict[str, Any]] = []
-    for index, raw in enumerate(raw_dossiers):
+    # Validate before scheduling any network or model work.
+    for raw in raw_dossiers:
         validate_dossier_shape(raw)
+    ai_semaphore = asyncio.Semaphore(AI_CONCURRENCY)
+
+    async def process_one(index: int, raw: dict[str, Any]) -> dict[str, Any]:
         dossier = {**shared, **raw}
         dossier, texts = await fetch_and_prepare_dossier(dossier)
         dossier_id = get_dossier_id(raw, index)
@@ -1466,9 +1497,8 @@ async def build_response(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
         source_text = json.dumps(dossier, ensure_ascii=False, indent=2)
         for name, text in texts:
             source_text += f"\n\n--- {name} ---\n{text}"
-        # Parse structured case files first. Spend a model call only when natural-language
-        # extraction or authority parsing is genuinely incomplete; structured 70-case batches
-        # should not incur 70 unnecessary remote inference calls.
+        # Parse structured case files first; use AI only when deterministic extraction is
+        # incomplete. AI requests are bounded and semaphore-limited to keep batches timely.
         facts = extract_request_facts(dossier, None, source_text, texts)
         facts["dossierId"] = dossier_id
         authority = approval_info(dossier, None, facts, source_text)
@@ -1481,7 +1511,10 @@ async def build_response(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
             or authority.get("signed") is not True
             or authority.get("provenanceVerified") is not True
         )
-        ai = await ask_model_for_facts(dossier, source_text) if needs_model else {}
+        ai: dict[str, Any] = {}
+        if needs_model:
+            async with ai_semaphore:
+                ai = await ask_model_for_facts(dossier, source_text)
         if ai:
             facts = extract_request_facts(dossier, ai, source_text, texts)
             facts["dossierId"] = dossier_id
@@ -1489,14 +1522,12 @@ async def build_response(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
         target, args, reason, authorized = choose_proposal(dossier, facts, authority)
         evidence = make_evidence(dossier, facts, authority, texts)
         call_id = stable_call_id(dossier_id, digest, target, args, index)
-        proposal = {
+        return {
             "dossierId": dossier_id,
             "inputDigest": digest,
             "callId": call_id,
             "target": target,
             "payload": args,
-            # `proposal` is the canonical executable proposal; `action` is a descriptive alias
-            # retained for clients whose envelope names the tool call as an action.
             "proposal": {
                 "callId": call_id,
                 "dossierId": dossier_id,
@@ -1521,7 +1552,9 @@ async def build_response(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
                 "caseNotTerminal": authority.get("alreadyTerminal") is False,
             },
         }
-        proposals.append(proposal)
+
+    # Preserve request ordering while avoiding a slow dossier serializing the whole batch.
+    proposals = await asyncio.gather(*(process_one(index, raw) for index, raw in enumerate(raw_dossiers)))
     if not proposals or len(proposals) != len(raw_dossiers):
         raise HTTPException(status_code=422, detail="request must produce exactly one proposal per dossier")
     if len({p["dossierId"] for p in proposals}) != len(proposals):
