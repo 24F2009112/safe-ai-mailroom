@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+mailroom_audit.sqlite3
+.pytest_cache/
+.DS_Store

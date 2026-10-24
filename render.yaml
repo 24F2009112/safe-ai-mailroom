@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: safe-ai-mailroom
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: DATABASE_PATH
+        value: ./mailroom_audit.sqlite3
+      - key: AI_TIMEOUT_SECONDS
+        value: "20"
+      - key: RECEIPT_HMAC_SECRET
+        sync: false
+      - key: RECEIPT_PUBLIC_KEY
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
