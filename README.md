@@ -1,83 +1,131 @@
 # Safe AI Mailroom Agent
 
-A deployable HTTPS API for the “Safe AI Mailroom” task. It extracts mail/approval facts, checks authority **before** proposing a consequential action, cites source-verifiable evidence, logs decisions, and refuses to record completion until a matching signed receipt is cryptographically verified.
+A public HTTPS FastAPI service for the Safe AI Mailroom assignment (build 2.1.0). It reads mail/request and approval sources, checks signed/current/provenance-backed authority against the exact action, recipient, item and case state, emits one auditable proposal per dossier, and never sends email or executes external actions. It records completion only after verifying a cryptographic terminal receipt that matches the stored proposal.
 
-## What it does
+## Endpoints
 
-- `POST /v1/mailroom/actions`: evaluates one case and returns exactly one selected action plus evidence and an authority report.
-- `GET /health`: checks service and audit-store availability.
-- `GET /.well-known/agent.json` and `GET /.well-known/agent-card.json`: public Agent Card metadata.
-- `GET /v1/mailroom/actions/{action_id}`: retrieves the stored decision.
-- Uses an OpenAI-compatible API for natural-language extraction when `OPENAI_API_KEY` is configured. Normal code—not the model—does the final authorization, scope checks, hashing, database writes, and receipt signature verification.
-- Without an AI key, it uses a conservative fallback parser. It may hold more cases for review; that is safer than guessing.
-- It **does not send/forward/release email or documents**. It returns a decision/proposal for the external system to execute. It never marks a consequential action complete without a valid signed receipt.
+- `POST /v1/mailroom/actions` — propose exactly one action per dossier.
+- `POST /v1/mailroom/propose` — alias for the proposal endpoint.
+- `POST /v1/mailroom/commit` — validate and commit a signed terminal receipt.
+- `POST /v1/mailroom/actions/commit` — alias for commit.
+- `POST /v1/mailroom/actions/{callId}/commit` — commit receipt for one call.
+- `GET /v1/mailroom/actions/{callId}` — read stored proposal state.
+- `GET /v1/mailroom/audit/{dossierId}` — read the audit records for a dossier.
+- `GET /health` and `/healthz` — health/database status.
+- `GET /.well-known/agent.json` and `/.well-known/agent-card.json` — public agent metadata.
 
-## Request contract
+## Proposal request
 
-Send a JSON object. The service accepts either structured fields or natural-language case content. Example:
+The API accepts a single dossier or a batch. A dossier should include its own stable `dossierId` and `inputDigest`, request/mail source, approval/authority source, case state, and permitted action definitions. The parser supports common field names; a supplied action menu is preferred over invented targets.
+
+Example:
 
 ```json
 {
-  "case_id": "case-104",
-  "email": {
-    "from": "manager@example.com",
-    "to": "maya@example.com",
-    "requested_action": "forward",
-    "document": "Q3-report.pdf",
-    "body": "Please forward Q3-report.pdf to maya@example.com."
-  },
-  "approval": {
-    "signed": true,
-    "status": "current",
-    "action": "forward",
-    "recipient": "maya@example.com",
-    "document": "Q3-report.pdf"
-  },
-  "permitted_actions": ["forward", "hold_for_review", "request_clarification"]
+  "requestId": "req-001",
+  "dossiers": [
+    {
+      "dossierId": "case-104",
+      "inputDigest": "sha256:source-digest-104",
+      "email": {
+        "from": "manager@example.com",
+        "to": "maya@example.com",
+        "requested_action": "forward",
+        "document": "Q3-report.pdf",
+        "body": "Please forward Q3-report.pdf to maya@example.com."
+      },
+      "approval": {
+        "signed": true,
+        "signatureValid": true,
+        "status": "current",
+        "action": "forward",
+        "recipient": "maya@example.com",
+        "document": "Q3-report.pdf",
+        "signer": "Operations Director",
+        "provenance": "internal approval registry"
+      },
+      "caseState": "open",
+      "permittedActions": [
+        { "target": "mail.forward", "payload": { "to": "${recipient}", "item": "${item}" } },
+        { "target": "mailroom.hold_for_review", "payload": {} }
+      ]
+    }
+  ]
 }
 ```
 
-The names `message`, `mail`, `inbound_email`, `case_file`, `authority`, `authorization`, `approval_document`, `allowed_actions`, `available_actions`, and `action_options` are also accepted in common locations. If the caller provides action options, the agent selects from that menu when possible. If it contains no safe fallback and the requested action is not authorized, the response explicitly says no external action is authorized.
+Example response shape:
 
-Response key fields:
+```json
+{
+  "ok": true,
+  "contractVersion": "mailroom.proposal.v2",
+  "requestId": "req-001",
+  "proposals": [
+    {
+      "dossierId": "case-104",
+      "inputDigest": "sha256:source-digest-104",
+      "callId": "call_<stable-id>",
+      "target": "mail.forward",
+      "payload": { "to": "maya@example.com", "item": "Q3-report.pdf" },
+      "proposal": { "target": "mail.forward", "payload": { "to": "maya@example.com", "item": "Q3-report.pdf" } },
+      "evidence": [],
+      "authorized": true,
+      "decision": "authorized",
+      "audit": { "state": "proposed", "executionPerformed": false }
+    }
+  ],
+  "audit": { "proposalCount": 1, "executionPerformed": false, "outboundCalls": 0, "outboundCanaryCap": 0 }
+}
+```
 
-- `action_id`: stable identifier for the proposed action.
-- `action` / `selected_action`: single selected action.
-- `authority_check.authorized`: true only when the signature is established, approval status is current, and the action, recipient, and document scopes match.
-- `evidence`: verbatim quotes validated against the submitted case payload; an unverified model quote is discarded.
-- `receipt.verified` and `completed`: false until a signed receipt has a valid signature and matches `case_id`, `action_id`, action, and recipient.
+The example `evidence` list is abbreviated here; real response citations contain the source file, line/path, quoted source text and the fact each quote supports. The `actions` field mirrors `proposals` for clients that label action proposals separately. `target` and `payload` are drawn from the supplied menu when one is present; payload contains only the documented argument keys for that target.
 
-## Receipt signatures
+## Safety rules
 
-A Boolean such as `"verified": true` is not trusted. Configure **one** mechanism that matches the receipt issuer:
+- A current status alone is not enough. Authority must be signed/verified, provenance-backed and match the exact requested action, recipient and requested document/item.
+- Expired, revoked, superseded, stale or conflicting authority state takes precedence over an optimistic status.
+- Already completed/sent/delivered cases are not proposed for a second outbound action.
+- A mismatch or missing authority selects a safe permitted review/hold action when available. The service never invokes email, messaging, payment, or other external tools; `outboundCalls` and `outboundCanaryCap` are always zero.
+- Evidence quotes are copied from supplied inputs or fetched case files. Generic filler lines are not added when a relevant citation is missing.
+- Malformed JSON is rejected with HTTP 400; empty/invalid request envelopes are rejected with HTTP 422.
+- Idempotency keys return a stable response for identical requests and HTTP 409 when reused for a different body. Conflicting call ID or receipt replays return HTTP 409.
+- Invalid/unsigned/mismatched/nonterminal receipts are rejected and never mark a proposal complete.
+
+## Receipt verification
+
+Set one verification mechanism only when it matches the actual receipt issuer:
 
 ### HMAC-SHA256
 
-Set `RECEIPT_HMAC_SECRET` to a shared secret in the deployment's secret/environment settings. The receipt issuer must HMAC-sign UTF-8 compact canonical JSON (`sort_keys=True`, separators `(',', ':')`) containing all receipt fields **except** `signature`, `signature_algorithm`, `algorithm`, and `verified`. For example, the signed body may be:
-
-```json
-{
-  "case_id": "case-104",
-  "action_id": "act_<id returned by the agent>",
-  "action": "forward",
-  "recipient": "maya@example.com",
-  "issued_at": "2026-10-24T10:00:00Z",
-  "signature_algorithm": "hmac-sha256",
-  "signature": "<lowercase hex HMAC-SHA256>"
-}
-```
-
-The HMAC is calculated over the compact JSON with `signature` and `signature_algorithm` removed. The above sample's `signature` is a placeholder, not a usable receipt. The agent requires the exact `case_id`, `action_id`, action and recipient to match the proposed action.
+Set `RECEIPT_HMAC_SECRET` in Render's Environment settings. The issuer must sign canonical JSON encoded as UTF-8 with keys sorted and separators `(',', ':')`, excluding the signature and algorithm/verification metadata fields. Signature is hexadecimal HMAC-SHA256 (optionally prefixed `sha256=`).
 
 ### Ed25519
 
-Alternatively configure `RECEIPT_PUBLIC_KEY` with the receipt issuer's PEM-encoded Ed25519 **public** key and set `signature_algorithm` to `ed25519`. The receipt issuer signs the same canonical unsigned JSON. Never put a private key in this service.
+Alternatively, set `RECEIPT_PUBLIC_KEY` to the trusted issuer's PEM public key, and use an `ed25519` signature (hex or base64). Do not place a private key in this service. Do not trust a `verified: true` field as proof of a signature. If the assignment supplies a different verifier/key/signature scheme, implement that exact documented scheme; do not invent a secret or bypass verification.
 
-If the task platform provides a proprietary receipt signature scheme, adapt `verify_receipt_signature()` to that documented scheme rather than bypassing verification.
+The commit request shape is:
 
-## Run locally (Windows PowerShell)
+```json
+{
+  "callId": "call_<value-from-proposal>",
+  "inputDigest": "<exact-digest-from-proposal>",
+  "receipt": {
+    "dossierId": "<exact-dossierId>",
+    "callId": "call_<value-from-proposal>",
+    "inputDigest": "<exact-digest-from-proposal>",
+    "target": "mail.forward",
+    "payload": { "to": "maya@example.com", "item": "Q3-report.pdf" },
+    "status": "delivered",
+    "signature_algorithm": "hmac-sha256",
+    "signature": "<issuer-generated-signature>"
+  }
+}
+```
 
-Install Python 3.11 or 3.12, then:
+All receipt IDs, digest, target and payload must match the stored proposal exactly, and the receipt must describe a terminal success state.
+
+## Run locally (PowerShell)
 
 ```powershell
 cd safe-ai-mailroom
@@ -85,106 +133,50 @@ py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-Set environment variables for the current PowerShell session (or configure them in your IDE):
-
-```powershell
-$env:OPENAI_API_KEY = "YOUR_API_KEY"
-$env:OPENAI_MODEL = "gpt-4o-mini"
 $env:DATABASE_PATH = ".\mailroom_audit.sqlite3"
-```
-
-Then run:
-
-```powershell
+$env:RECEIPT_HMAC_SECRET = "local-test-secret"
 uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Test the health and card endpoints in a second PowerShell window:
+Set `OPENAI_API_KEY` if you want the optional model-assisted extraction of natural-language mail. Normal code, not the model, makes the authority decision, validates inputs, writes the audit log, and verifies receipts. No API key means deterministic parsing and conservative hold-for-review behavior for ambiguous cases.
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health
-Invoke-RestMethod http://127.0.0.1:8000/.well-known/agent.json
-```
+## Deployment on Render
 
-Test a case:
+The current repository includes a `Dockerfile` and works as a Render Docker Web Service.
 
-```powershell
-$body = @{
-  case_id = "case-104"
-  email = @{
-    from = "manager@example.com"
-    to = "maya@example.com"
-    requested_action = "forward"
-    document = "Q3-report.pdf"
-    body = "Please forward Q3-report.pdf to maya@example.com."
-  }
-  approval = @{
-    signed = $true
-    status = "current"
-    action = "forward"
-    recipient = "maya@example.com"
-    document = "Q3-report.pdf"
-  }
-  permitted_actions = @("forward", "hold_for_review", "request_clarification")
-} | ConvertTo-Json -Depth 10
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/v1/mailroom/actions -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 12
-```
+- Repository: `24F2009112/safe-ai-mailroom`
+- Branch: `main`
+- Root directory: blank (repository root)
+- Docker build context: `.`
+- Dockerfile path: `./Dockerfile`
+- Health check path: `/health`
+- Free instance is sufficient for evaluation, but it may spin down while idle.
 
-This sample intentionally has no receipt, so even a correctly scoped proposal must return `completed: false` / a waiting state.
+Recommended environment settings:
 
-## Deploy publicly on Render (recommended)
+- `OPENAI_API_KEY` — valid key if using model-assisted extraction.
+- `OPENAI_MODEL` — a model available to the API account, e.g. `gpt-4o-mini`.
+- `DATABASE_PATH` — `./mailroom_audit.sqlite3`.
+- `RECEIPT_HMAC_SECRET` or `RECEIPT_PUBLIC_KEY` — only the real trusted receipt-verification mechanism supplied by the assignment.
 
-1. Create a GitHub repository named `safe-ai-mailroom` and push the files in this folder.
-2. In Render, choose **New → Web Service**, connect that repository, and use:
-   - Runtime: Python
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-   - Health check path: `/health`
-3. In Render → Environment, add `OPENAI_API_KEY` and set `OPENAI_MODEL` to a model available to your API account. Add the receipt verification secret/public key only if you have the real receipt issuer's scheme and key. Do not invent a key and expect platform-signed receipts to validate.
-4. Deploy. Wait until Render reports the service as live.
-5. Test these public URLs in a browser:
-   - `https://YOUR-SERVICE.onrender.com/health`
-   - `https://YOUR-SERVICE.onrender.com/.well-known/agent.json`
-6. In the assignment box, enter **the full HTTPS action endpoint**, not the home page:
+Never put secrets in GitHub. SQLite on a free instance is not durable across every restart/redeploy; the proposal/commit replay checks persist within the current instance storage.
 
-   `https://YOUR-SERVICE.onrender.com/v1/mailroom/actions`
-
-7. Use **Check** first and inspect the response. Do not spend all checks on guesses; the page says the last check is reserved for **Save**. Once the endpoint passes the cases, click **Save** with a check still available.
-
-Render's free service may sleep when idle, so the first request can take longer. The local SQLite file on a free instance is not a durable database across all redeploys; for the assignment's immediate validation it can work, but use a persistent disk or external database if audit history must survive restarts.
-
-## Push from PowerShell
-
-Run in the folder containing `main.py`:
-
-```powershell
-git init
-git add .
-git commit -m "Build safe AI mailroom agent"
-git branch -M main
-git remote add origin https://github.com/YOUR-USERNAME/safe-ai-mailroom.git
-git push -u origin main
-```
-
-If the repository already exists and you intentionally want to replace its remote branch, confirm the remote and branch first; do not force-push blindly.
-
-## Smoke test a deployed endpoint
+## Smoke test
 
 ```powershell
 python smoke_test.py https://YOUR-SERVICE.onrender.com
 ```
 
-The script checks health, both Agent Card URLs, one correctly scoped approval, recipient mismatch, and expired approval. It does not consume any checks on the assignment website; it calls your endpoint directly.
+This calls the service directly and does not consume assignment checks. It checks the proposal envelope, one proposal per dossier, exact IDs/digests, arguments, evidence presence, strict scope rejection, idempotency/stable reuse, conflict rejection, malformed-request rejection, and invalid receipt rejection. Receipt-commit success also requires a correctly configured trusted verification key and a valid issuer-generated signed receipt.
 
-## Important grading checks
+## Push the updated version
 
-- HTTPS public endpoint; use `/v1/mailroom/actions` in the assignment field.
-- Current signed authority must match the requested **action + recipient + document/item**. A signed document alone is insufficient.
-- Evidence must quote source text, not just provide a vague explanation.
-- Stale/revoked/expired approval or a different recipient must not authorize the requested action.
-- Never return `completed: true` just because the action was chosen or an unsigned receipt says it succeeded.
-- A real receipt must match the same `case_id`, `action_id`, action and recipient and pass signature validation.
-- Read the assignment's actual failing response carefully. If it specifies a different payload schema, update this adapter to that exact contract before using more checks.
+From this folder in PowerShell, the safe normal update is:
+
+```powershell
+git add main.py smoke_test.py README.md
+git commit -m "Fix mailroom proposal contract and safety checks"
+git push origin main
+```
+
+Wait for Render to redeploy and show **Live**, then rerun the smoke test before using another assignment Check. The assignment feedback is the final authority for whether its hidden contract accepts this adapter. Save a check for the final Save action.
